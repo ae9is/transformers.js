@@ -32,7 +32,7 @@
     "format:check": "prettier --check .",
     "typegen": "tsc ./src/transformers.js --allowJs --declaration --emitDeclarationOnly --declarationMap --outDir types",
     "dev": "webpack serve --no-client-overlay",
-    "build": "webpack && npm run typegen",
+    "ready": "webpack && npm run typegen",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --verbose",
     "readme": "python ./docs/scripts/build_readme.py",
     "docs-api": "node ./docs/scripts/generate.js",
