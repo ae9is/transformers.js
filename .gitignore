@@ -13,3 +13,6 @@ deno.lock
 
 # Do not track coverage reports
 /coverage
+
+*bak
+.turbo
