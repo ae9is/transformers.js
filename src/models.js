@@ -3477,16 +3477,32 @@ export class WhisperForConditionalGeneration extends WhisperPreTrainedModel {
                 }
             }
             if (language) {
-                // Add language token
-                const language_code = whisper_language_to_code(language);
-                const language_token = `<|${language_code}|>`;
-                lang_id = generation_config.lang_to_id[language_token];
+              // Add language token
+              const language_code = whisper_language_to_code(language);
+              const language_token = `<|${language_code}|>`;
+              const lang_to_id = generation_config.lang_to_id;
+              if (!lang_to_id || Object.keys(lang_to_id).length <= 0) {
+                console.warn(
+                  "Model generation config has no `lang_to_id` map, cannot set language",
+                );
+                lang_id = null;
+              } else {
+                lang_id = lang_to_id[language_token];
+              }
             }
             init_tokens.push(lang_id);
 
             // Add task token
             // NOTE: Defaults to 'transcribe' if no task is specified
-            init_tokens.push(generation_config.task_to_id[task ?? 'transcribe']);
+            const task_to_id = generation_config.task_to_id;
+            if (!task_to_id || Object.keys(task_to_id).length <= 0) {
+              console.warn(
+                "Model generation config has no `task_to_id` map, defaulting to 'transcribe' task",
+              );
+            }
+            const task_token =
+              generation_config.task_to_id?.[task ?? "transcribe"];
+            init_tokens.push(task_token);
 
         } else if (language || task) {
             throw new Error(
@@ -3511,7 +3527,9 @@ export class WhisperForConditionalGeneration extends WhisperPreTrainedModel {
         }
 
         // let's make sure we don't pass `null` tokens as prompt tokens
-        return init_tokens.filter(token => token != null);
+        const filtered = init_tokens.filter((token) => token != null);
+        console.debug("Initial tokens for generation:", filtered);
+        return filtered;
     }
 
     /**
@@ -3535,6 +3553,8 @@ export class WhisperForConditionalGeneration extends WhisperPreTrainedModel {
         } = options;
 
         generation_config = this._prepare_generation_config(generation_config, kwargs);
+        console.debug("Options:", options);
+        console.debug("Generation config:", generation_config);
 
         const init_tokens = kwargs.decoder_input_ids ?? await this._retrieve_init_tokens({ ...options, generation_config });
 
