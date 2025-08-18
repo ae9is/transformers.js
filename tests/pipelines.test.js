@@ -793,6 +793,27 @@ xdescribe("Pipelines (ignored)", () => {
       },
       MAX_TEST_EXECUTION_TIME,
     );
+
+    it(
+      `${models[1]}-translate-english-to-other`,
+      async () => {
+        let transcriber = await pipeline("automatic-speech-recognition", models[1]);
+        let url = "https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/jfk.wav";
+        let audioData = await loadAudio(url);
+        {
+          // Translate English audio to French text
+          let output = await transcriber(audioData, {
+            language: "french",
+            task: "transcribe",
+          });
+          expect(output.text.length).toBeGreaterThan(50);
+          const expected = "Et donc, mes chers compatriotes américains, ne vous demandez pas ce que votre pays peut faire pour vous, mais ce que vous pouvez faire pour votre pays.";
+          compareString(expected, output.text, 0.7);
+        }
+        await transcriber.dispose();
+      },
+      MAX_TEST_EXECUTION_TIME,
+    );
     
     it(
       models[2].join(" + "),
