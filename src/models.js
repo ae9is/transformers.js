@@ -3528,7 +3528,6 @@ export class WhisperForConditionalGeneration extends WhisperPreTrainedModel {
 
         // let's make sure we don't pass `null` tokens as prompt tokens
         const filtered = init_tokens.filter((token) => token != null);
-        console.debug("Initial tokens for generation:", filtered);
         return filtered;
     }
 
@@ -3553,8 +3552,6 @@ export class WhisperForConditionalGeneration extends WhisperPreTrainedModel {
         } = options;
 
         generation_config = this._prepare_generation_config(generation_config, kwargs);
-        console.debug("Options:", options);
-        console.debug("Generation config:", generation_config);
 
         const init_tokens = kwargs.decoder_input_ids ?? await this._retrieve_init_tokens({ ...options, generation_config });
 
