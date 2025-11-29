@@ -818,7 +818,7 @@ xdescribe("Pipelines (ignored)", () => {
     it(
       models[2].join(" + "),
       async () => {
-        let transcriber = await pipeline("automatic-speech-recognition", m(models[2][0]), {
+        let transcriber = await pipeline("automatic-speech-recognition", models[2][0], {
           revision: models[2][1],
           quantized: false,
         });
@@ -868,7 +868,7 @@ xdescribe("Pipelines (ignored)", () => {
     it(
       models[3].join(" + "),
       async () => {
-        let transcriber = await pipeline("automatic-speech-recognition", m(models[3][0]), {
+        let transcriber = await pipeline("automatic-speech-recognition", models[3][0], {
           revision: models[3][1],
         });
 
@@ -927,7 +927,7 @@ xdescribe("Pipelines (ignored)", () => {
     it(
       models[4],
       async () => {
-        let transcriber = await pipeline("automatic-speech-recognition", m(models[4]));
+        let transcriber = await pipeline("automatic-speech-recognition", models[4]);
 
         let url = "https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/jfk.wav";
         let audioData = await loadAudio(url);
