@@ -6341,6 +6341,122 @@ export class ParakeetForCTC extends ParakeetPreTrainedModel {
         return new CausalLMOutput(await super._call(model_inputs));
     }
 }
+
+/**
+ * Parakeet TDT (Token-and-Duration Transducer) model for speech recognition.
+ * This model uses an encoder-decoder architecture with a joint network.
+ */
+export class ParakeetForTDT extends ParakeetPreTrainedModel {
+    /**
+     * Runs the encoder model
+     * @param {Object} model_inputs
+     * @param {Tensor} model_inputs.input_features Input audio features
+     * @param {Tensor} model_inputs.attention_mask Attention mask
+     * @returns {Promise<Object>} Encoder outputs
+     */
+    async encode(model_inputs) {
+        const session = this.sessions['model'];
+
+        // Map input names: feature extractor outputs input_features/attention_mask
+        // but encoder expects audio_signal/length
+
+        // Convert attention_mask to length (sum of mask values)
+        const mask = model_inputs.attention_mask;
+        const batch_size = mask.dims[0];
+        const length_data = new BigInt64Array(batch_size);
+
+        for (let i = 0; i < batch_size; i++) {
+            let count = 0n;
+            const offset = i * mask.dims[1];
+            for (let j = 0; j < mask.dims[1]; j++) {
+                count += mask.data[offset + j];
+            }
+            length_data[i] = count;
+        }
+
+        // Transpose input_features from [batch, time, features] to [batch, features, time]
+        // Feature extractor outputs [1, num_frames, 128]
+        // Encoder expects [1, 128, num_frames]
+        const input_features = model_inputs.input_features;
+        const [B, T, F] = input_features.dims;
+        const transposed_data = new Float32Array(B * T * F);
+
+        for (let b = 0; b < B; b++) {
+            for (let t = 0; t < T; t++) {
+                for (let f = 0; f < F; f++) {
+                    const src_idx = b * T * F + t * F + f;
+                    const dst_idx = b * F * T + f * T + t;
+                    transposed_data[dst_idx] = input_features.data[src_idx];
+                }
+            }
+        }
+
+        const encoder_inputs = {
+            audio_signal: new Tensor(input_features.type, transposed_data, [B, F, T]),
+            length: new Tensor('int64', length_data, [batch_size]),
+        };
+
+        return await encoderForward(this, encoder_inputs);
+    }
+
+    /**
+     * Runs the joint decoder network
+     * @param {Object} model_inputs
+     * @param {Tensor} model_inputs.encoder_outputs Full encoder hidden states [batch, 1024, time]
+     * @param {Tensor} model_inputs.targets Target token IDs [batch, target_length]
+     * @param {Tensor} [model_inputs.input_states_1] LSTM hidden states [2, batch, 640]
+     * @param {Tensor} [model_inputs.input_states_2] LSTM cell states [2, batch, 640]
+     * @returns {Promise<Object>} Joint network logits and updated states
+     */
+    async decode_joint(model_inputs) {
+        const session = this.sessions['decoder_model_merged'];
+
+        // TDT joint network expects: encoder_outputs, targets, target_length, input_states_1, input_states_2
+        const encoder_outputs = model_inputs.encoder_outputs;
+        const targets = model_inputs.targets;
+        const batch_size = encoder_outputs.dims[0];
+        const target_length = targets.dims[1];
+
+        // LSTM predictor has 2 layers with 640 hidden units
+        const lstm_hidden_size = 640;
+        const num_lstm_layers = 2;
+
+        // Initialize LSTM states if not provided: [2, batch, 640]
+        const input_states_1 = model_inputs.input_states_1 ||
+            new Tensor('float32', new Float32Array(num_lstm_layers * batch_size * lstm_hidden_size), [num_lstm_layers, batch_size, lstm_hidden_size]);
+        const input_states_2 = model_inputs.input_states_2 ||
+            new Tensor('float32', new Float32Array(num_lstm_layers * batch_size * lstm_hidden_size), [num_lstm_layers, batch_size, lstm_hidden_size]);
+
+        const joint_inputs = {
+            encoder_outputs: encoder_outputs,
+            targets: targets,
+            target_length: new Tensor('int32', new Int32Array([target_length]), [1]),
+            input_states_1: input_states_1,
+            input_states_2: input_states_2,
+        };
+
+        return await sessionRun(session, joint_inputs);
+    }
+
+    /**
+     * Forward pass combining encoder and decoder
+     * @param {Object} model_inputs
+     * @param {Tensor} model_inputs.input_features Input audio features
+     * @param {Tensor} model_inputs.attention_mask Attention mask
+     * @returns {Promise<Object>} Model outputs with logits
+     */
+    async _call(model_inputs) {
+        // Encode audio
+        const encoder_outputs = await this.encode(model_inputs);
+
+        // For greedy decoding during inference, we'll just return encoder outputs
+        // The actual decoding happens in the pipeline
+        return {
+            encoder_outputs: encoder_outputs.last_hidden_state,
+            ...encoder_outputs,
+        };
+    }
+}
 //////////////////////////////////////////////////
 
 
@@ -8125,6 +8241,7 @@ const MODEL_FOR_SPEECH_SEQ_2_SEQ_MAPPING_NAMES = new Map([
     ['whisper', ['WhisperForConditionalGeneration', WhisperForConditionalGeneration]],
     ['lite-whisper', ['LiteWhisperForConditionalGeneration', LiteWhisperForConditionalGeneration]],
     ['moonshine', ['MoonshineForConditionalGeneration', MoonshineForConditionalGeneration]],
+    ['parakeet_tdt', ['ParakeetForTDT', ParakeetForTDT]],
 ]);
 
 const MODEL_FOR_TEXT_TO_SPECTROGRAM_MAPPING_NAMES = new Map([

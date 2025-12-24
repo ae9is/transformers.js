@@ -1752,6 +1752,8 @@ export class AutomaticSpeechRecognitionPipeline extends (/** @type {new (options
             case 'hubert':
             case 'parakeet_ctc':
                 return this._call_wav2vec2(audio, kwargs)
+            case 'parakeet_tdt':
+                return this._call_parakeet_tdt(audio, kwargs)
             case 'moonshine':
                 return this._call_moonshine(audio, kwargs)
             default:
@@ -1793,6 +1795,228 @@ export class AutomaticSpeechRecognitionPipeline extends (/** @type {new (options
             }
             const predicted_sentences = this.tokenizer.decode(predicted_ids, { skip_special_tokens: true }).trim();
             toReturn.push({ text: predicted_sentences })
+        }
+        return single ? toReturn[0] : toReturn;
+    }
+
+    /**
+     * @type {AutomaticSpeechRecognitionPipelineCallback}
+     * @private
+     */
+    async _call_parakeet_tdt(audio, kwargs) {
+        if (kwargs.language) {
+            console.warn('`language` parameter is not yet supported for `parakeet_tdt` models.');
+        }
+        if (kwargs.task) {
+            console.warn('`task` parameter is not yet supported for `parakeet_tdt` models.');
+        }
+
+        const single = !Array.isArray(audio);
+        if (single) {
+            audio = [/** @type {AudioInput} */ (audio)];
+        }
+
+        const sampling_rate = this.processor.feature_extractor.config.sampling_rate;
+        const preparedAudios = await prepareAudios(audio, sampling_rate);
+
+        const toReturn = [];
+        for (const aud of preparedAudios) {
+            // Process audio features
+            const inputs = await this.processor(aud);
+
+            // Encode audio
+            // @ts-expect-error - ParakeetForTDT has encode method
+            const encoder_result = await this.model.encode(inputs);
+
+            // The encoder returns raw ONNX outputs with 'outputs' key
+            // Encoder output shape: [batch, 1024, time_steps]
+            const encoder_hidden_states = encoder_result.outputs
+                || encoder_result.encoded
+                || encoder_result.last_hidden_state
+                || encoder_result[Object.keys(encoder_result)[0]];
+
+            if (!encoder_hidden_states || !encoder_hidden_states.dims) {
+                throw new Error(`Encoder outputs missing hidden states. Got outputs: ${Object.keys(encoder_result).join(', ')}`);
+            }
+
+            // Encoder output shape: [batch, hidden_dim=1024, time_steps]
+            const [batch_size, hidden_dim, time_steps] = encoder_hidden_states.dims;
+
+            // TDT decoding constants
+            const vocab_size = 8193;
+            const blank_id = vocab_size - 1; // 8192 is blank
+            const eos_id = 3; // <|endoftext|>
+            const max_symbols = 500; // Maximum output length
+            const num_durations = 5; // TDT has 5 duration classes (0-4)
+
+            // LSTM predictor state dimensions
+            const lstm_hidden_size = 640;
+            const num_lstm_layers = 2;
+
+            // Initialize LSTM states: [2, batch, 640]
+            let lstm_hidden = new Tensor(
+                'float32',
+                new Float32Array(num_lstm_layers * batch_size * lstm_hidden_size),
+                [num_lstm_layers, batch_size, lstm_hidden_size]
+            );
+            let lstm_cell = new Tensor(
+                'float32',
+                new Float32Array(num_lstm_layers * batch_size * lstm_hidden_size),
+                [num_lstm_layers, batch_size, lstm_hidden_size]
+            );
+
+            const predicted_tokens = [];
+            const token_frames = []; // Track frame position for each token
+            let num_symbols = 0;
+            let t = 0; // Current encoder time position
+
+            // Timestamp calculation parameters
+            // subsampling_factor converts encoder frames to audio samples
+            // @ts-expect-error - subsampling_factor is not defined in the base class
+            const subsampling_factor = this.model.config.subsampling_factor || 8;
+            const hop_length = this.processor.feature_extractor.config.hop_length || 160;
+            const frame_duration = (subsampling_factor * hop_length) / sampling_rate;
+
+            // Greedy TDT decoding
+            while (t < time_steps && num_symbols < max_symbols) {
+                // Build target sequence - use last predicted token or start token
+                const last_token = predicted_tokens.length > 0
+                    ? predicted_tokens[predicted_tokens.length - 1]
+                    : 0;
+                const targets = new Tensor('int32', new Int32Array([last_token]), [1, 1]);
+
+                try {
+                    // @ts-expect-error - ParakeetForTDT has decode_joint method
+                    const joint_output = await this.model.decode_joint({
+                        encoder_outputs: encoder_hidden_states,
+                        targets: targets,
+                        input_states_1: lstm_hidden,
+                        input_states_2: lstm_cell,
+                    });
+
+                    // Update LSTM states if returned
+                    if (joint_output.output_states_1) {
+                        lstm_hidden = joint_output.output_states_1;
+                    }
+                    if (joint_output.output_states_2) {
+                        lstm_cell = joint_output.output_states_2;
+                    }
+
+                    // Get logits - output shape: [batch, encoder_time, target_len, vocab+durations]
+                    const logits = joint_output.outputs || joint_output.logits;
+                    if (!logits || !logits.data) {
+                        throw new Error('No logits in joint output');
+                    }
+
+                    // Extract logits for current encoder position (t) and target position (0)
+                    // Output is [batch, time, target_len, 8198] where 8198 = 8193 vocab + 5 durations
+                    const total_vocab = logits.dims[logits.dims.length - 1]; // Last dim is vocab+durations
+                    const target_len = logits.dims.length > 3 ? logits.dims[2] : 1;
+                    const stride = total_vocab * target_len;
+                    const offset = t * stride; // Get logits at time t, target position 0
+
+                    // Find best token (first vocab_size logits)
+                    let best_token = 0;
+                    let best_score = -Infinity;
+                    for (let i = 0; i < vocab_size; i++) {
+                        const score = logits.data[offset + i];
+                        if (score > best_score) {
+                            best_score = score;
+                            best_token = i;
+                        }
+                    }
+
+                    // Find best duration (next num_durations logits after vocab)
+                    let best_duration = 1;
+                    let best_dur_score = -Infinity;
+                    for (let d = 0; d < num_durations; d++) {
+                        const score = logits.data[offset + vocab_size + d];
+                        if (score > best_dur_score) {
+                            best_dur_score = score;
+                            best_duration = d;
+                        }
+                    }
+
+                    // Move forward by duration (minimum 1 frame)
+                    const frames_to_skip = Math.max(1, best_duration);
+
+                    if (best_token === blank_id) {
+                        // Blank token: just move forward in time
+                        t += frames_to_skip;
+                    } else if (best_token === eos_id) {
+                        // End of sequence
+                        break;
+                    } else {
+                        // Non-blank, non-EOS token: emit it with frame position
+                        predicted_tokens.push(best_token);
+                        token_frames.push(t);
+                        num_symbols++;
+                        t += frames_to_skip;
+                    }
+                } catch (error) {
+                    console.warn('TDT joint network call failed:', error.message);
+                    // Move to next frame on error
+                    t++;
+                }
+            }
+
+            // Decode tokens to text
+            const text = this.tokenizer.decode(predicted_tokens, { skip_special_tokens: true }).trim();
+
+            // Build result with optional timestamps
+            const result = { text };
+
+            if (kwargs.return_timestamps) {
+                // Generate word-level chunks with timestamps
+                const chunks = [];
+                let word_tokens = [];
+                let word_start_frame = null;
+
+                for (let i = 0; i < predicted_tokens.length; i++) {
+                    const token = predicted_tokens[i];
+                    const frame = token_frames[i];
+                    const token_text = this.tokenizer.decode([token], { skip_special_tokens: true });
+
+                    // Check if token starts a new word (contains leading space or is first token)
+                    if (token_text.startsWith(' ') || word_tokens.length === 0) {
+                        // Save previous word if any
+                        if (word_tokens.length > 0 && word_start_frame !== null) {
+                            const word_text = this.tokenizer.decode(word_tokens, { skip_special_tokens: true }).trim();
+                            if (word_text.length > 0) {
+                                const start_time = word_start_frame * frame_duration;
+                                const end_time = frame * frame_duration;
+                                chunks.push({
+                                    text: word_text,
+                                    timestamp: [start_time, end_time],
+                                });
+                            }
+                        }
+                        // Start new word
+                        word_tokens = [token];
+                        word_start_frame = frame;
+                    } else {
+                        // Continue current word
+                        word_tokens.push(token);
+                    }
+                }
+
+                // Save last word
+                if (word_tokens.length > 0 && word_start_frame !== null) {
+                    const word_text = this.tokenizer.decode(word_tokens, { skip_special_tokens: true }).trim();
+                    if (word_text.length > 0) {
+                        const start_time = word_start_frame * frame_duration;
+                        const end_time = t * frame_duration; // Use final frame position
+                        chunks.push({
+                            text: word_text,
+                            timestamp: [start_time, end_time],
+                        });
+                    }
+                }
+
+                result.chunks = chunks;
+            }
+
+            toReturn.push(result);
         }
         return single ? toReturn[0] : toReturn;
     }
@@ -1901,7 +2125,7 @@ export class AutomaticSpeechRecognitionPipeline extends (/** @type {new (options
             }
 
             // Merge text chunks
-            // @ts-ignore
+            // @ts-expect-error - _decode_asr is not defined in the base class
             const [full_text, optional] = this.tokenizer._decode_asr(chunks, {
                 time_precision, return_timestamps, force_full_sequences
             });
