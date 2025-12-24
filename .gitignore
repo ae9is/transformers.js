@@ -16,3 +16,4 @@ deno.lock
 
 *bak
 .turbo
+.venv
